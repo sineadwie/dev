@@ -30,6 +30,9 @@ from(
   group by 1,2,3
   order by 1,2,3) as sub;
 
+select * from regularity_temp_sw
+order by purchase_date;
+
 create or replace temp table run_info_temp_sw as
 select inferred_customer_id
     , transaction_key
@@ -39,6 +42,9 @@ select inferred_customer_id
 from regularity_temp_sw
 where days_between_purchases > 84 or days_between_purchases is null;
 
+select * from run_info_temp_sw
+order by run_start_date;
+
 create or replace temp table purchase_info_temp_sw as
 select inferred_customer_id
     , min(date_key) as first_purchase_date
@@ -46,7 +52,11 @@ select inferred_customer_id
 from active_customers_sw as c
 inner join adw_prod.inc_pl.transaction_dim as t
 on c.customer_key = t.customer_key
+and date_key <= $end_date
 group by 1;
+
+select * from purchase_info_temp_sw
+order by first_purchase_date;
 
 create or replace temp table run_start_end_temp_sw as
 select r.inferred_customer_id
@@ -62,6 +72,9 @@ from run_info_temp_sw as r
 left join purchase_info_temp_sw as p
 on r.inferred_customer_id = p.inferred_customer_id;
 
+select * from run_start_end_temp_sw
+order by run_number;
+
 create or replace temp table run_final_sw as
 select c.inferred_customer_id
     ,date_key
@@ -75,11 +88,11 @@ left join run_start_end_temp_sw as r
 on c.inferred_customer_id = r.inferred_customer_id
 and run_start <= date_key
 and run_end >= date_key
+and date_key <= $end_date
 order by 1,2;
 
 select inferred_customer_id
     , max(run_number)
-    , max(run_start)
-    , max(run_end)
+    , datediff(d, max(run_start), max(run_end)) as days_in_latest_run
 from run_final_sw
 group by 1;
