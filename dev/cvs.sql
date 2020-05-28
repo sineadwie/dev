@@ -3,7 +3,6 @@ USE DATABASE customer_analytics;
 USE SCHEMA sandbox;
 USE WAREHOUSE ADW_HEAVY_ADHOC_WH;
 
--- SETUP SQL VARIABLES
 -- set the financial periods that are required
 SET (f_start, f_end) = (201903, 202002);
 
@@ -14,7 +13,6 @@ set spend = 3.5;
 set tenure = 2;
 set sow	= 0.75;
 set touchpoints = 0.75;
-set nectar_start_year=2002;
 
 -- from the financial periods get the start and end date
 set (start_date, end_date) = (SELECT MIN(DATE_KEY)
@@ -22,11 +20,8 @@ set (start_date, end_date) = (SELECT MIN(DATE_KEY)
                               FROM adw_prod.inc_pl.date_dim
                               WHERE fin_period_no BETWEEN $F_START AND $F_END);
 
--- extract the current date from the end date
-set current_year = extract(year from $end_date);
-
--- calculate the number of years since nectar first started (2002)
-set nectar_years = $current_year-$nectar_start_year;
+-- set the number of days that need to have passed for a customer to be considered as lapsed
+set days_between_purchases_cutoff = 84;
 
 -- DEFINE THE CUSTOMER DOMAIN
 -- create a table that contains all customers and flags active customers
@@ -39,8 +34,6 @@ FROM
     	, MAX(CASE WHEN t.date_key BETWEEN $start_date AND $end_date
     		  AND transaction_value > 0
     		  AND transaction_item_count > 0 THEN 1 ELSE 0 END) AS active_customer
-//fix to be more similar to old model
-//        , 1 AS active_customer
     FROM adw_prod.inc_pl.customer_dim AS c
     LEFT JOIN adw_prod.inc_pl.transaction_dim AS t
     ON c.customer_key = t.customer_key
@@ -122,7 +115,7 @@ FROM (
             SELECT inferred_customer_id
                 , CASE WHEN COUNT(date_key) > 2 THEN 1 ELSE 0 END AS transaction_days_count
             FROM cvs_regularity_part1
-            WHERE lead_date_key is not null
+            WHERE lead_date_key IS NOT NULL
             GROUP BY 1) AS b
       ON a.inferred_customer_id = b.inferred_customer_id
       WHERE transaction_days_count = 1
@@ -132,26 +125,88 @@ FROM (
 CREATE
 	OR replace TEMP TABLE cvs_regularity AS
 SELECT inferred_customer_id
-	, AVG(days_between_purchases) AS regularity
-	, LOG(10, (AVG(days_between_purchases) + 1)) AS log_regularity
+	, IFNULL(AVG(days_between_purchases),0) AS regularity
+	, IFNULL(LOG(10, (AVG(days_between_purchases) + 1)),0) AS log_regularity
 FROM cvs_regularity_part2
 WHERE days_between_purchases <= (reg_q3 + (reg_q3 - reg_q1) * 1.5)
 	AND days_between_purchases IS NOT NULL
 GROUP BY 1;
 
 -- TENURE
--- needs to be changed
-CREATE
-	OR replace TEMP TABLE cvs_tenure AS
+CREATE OR replace TEMP TABLE cvs_tenure_regularity AS
+SELECT inferred_customer_id
+    , date_key AS purchase_date
+    , transaction_key
+    , lead_date_key AS next_purchase_date
+    , DATEDIFF(d, date_key, lead_date_key) AS days_between_purchases
+FROM(
+  SELECT inferred_customer_id
+      , date_key
+      , transaction_key
+      , LEAD(date_key, 1) OVER(PARTITION BY inferred_customer_id order by date_key) AS lead_date_key
+  FROM cvs_active_customers AS c
+  INNER JOIN adw_prod.inc_pl.transaction_dim AS t
+  ON c.customer_key = t.customer_key
+  WHERE date_key <= $end_date
+  GROUP BY 1,2,3
+  ORDER BY 1,2,3) AS sub;
+
+CREATE OR replace TEMP TABLE cvs_tenure_run_info AS
+SELECT inferred_customer_id
+    , transaction_key
+    , days_between_purchases
+    , LAG(next_purchase_date, 1) OVER(PARTITION BY inferred_customer_id ORDER BY next_purchase_date) AS run_start_date
+    , purchase_date AS run_end_date
+FROM cvs_tenure_regularity
+WHERE days_between_purchases > $days_between_purchases_cutoff OR days_between_purchases IS NULL;
+
+CREATE OR replace TEMP TABLE cvs_tenure_purchase_info AS
+SELECT inferred_customer_id
+    , MIN(date_key) AS first_purchase_date
+    , MAX(date_key) AS last_purchase_date
+FROM cvs_active_customers AS c
+INNER JOIN adw_prod.inc_pl.transaction_dim AS t
+ON c.customer_key = t.customer_key
+AND date_key <= $end_date
+GROUP BY 1;
+
+CREATE OR replace TEMP TABLE cvs_run_start_end AS
+SELECT r.inferred_customer_id
+    , days_between_purchases
+    , IFNULL(run_start_date, first_purchase_date) AS run_start
+    , CASE WHEN days_between_purchases IS NULL
+        AND IFNULL(run_start_date, first_purchase_date) IS NOT NULL
+        THEN IFF(DATEDIFF(d, last_purchase_date, $end_date) > $days_between_purchases_cutoff, last_purchase_date, $end_date)
+        ELSE run_end_date END AS run_end
+    , IFF(DATEDIFF(d, last_purchase_date, $end_date) > $days_between_purchases_cutoff, 1, 0) AS lapsed
+    , ROW_NUMBER() over (partition by r.inferred_customer_id ORDER BY IFNULL(run_start_date, first_purchase_date)) AS run_number
+FROM cvs_tenure_run_info AS r
+LEFT JOIN cvs_tenure_purchase_info AS p
+ON r.inferred_customer_id = p.inferred_customer_id;
+
+CREATE OR replace TEMP TABLE cvs_tenure_combined AS
 SELECT c.inferred_customer_id
-    ,DATEDIFF(year, IFNULL(MIN(c.activation_date), MIN(t.date_key)), $end_date) AS tenure
-// fix to be closer to old model --> but should not be used in the future
--- 	, IFNULL(DATEDIFF(year, MIN(c.activation_date), $end_date), 7) AS tenure
-FROM cvs_active_customers AS ac
-LEFT JOIN adw_prod.inc_pl.customer_dim AS c
-	ON c.customer_key = ac.customer_key
-LEFT JOIN adw_prod.inc_pl.transaction_dim AS t
-	ON c.customer_key = t.customer_key
+    ,date_key
+    ,run_number
+    ,run_start
+    ,run_end
+    ,lapsed
+FROM cvs_active_customers AS c
+INNER JOIN adw_prod.inc_pl.transaction_dim AS t
+ON c.customer_key = t.customer_key
+LEFT JOIN cvs_run_start_end AS r
+ON c.inferred_customer_id = r.inferred_customer_id
+AND run_start <= date_key
+AND run_end >= date_key
+AND date_key <= $end_date
+ORDER BY 1,2;
+
+CREATE OR replace TEMP TABLE cvs_tenure AS
+SELECT inferred_customer_id
+    , MAX(run_number) AS number_of_runs
+    , MAX(lapsed) AS lapsed
+    , IFF(MAX(lapsed) = 0, DATEDIFF(d, MAX(run_start), MAX(run_end)), 0) AS tenure --days_in_latest_run
+FROM cvs_tenure_combined
 GROUP BY 1;
 
 -- SOW SHARE OF WALLET
@@ -228,14 +283,12 @@ LEFT JOIN adw_prod.inc_pl.item_fact AS f
 	ON c.customer_key = f.customer_key
 LEFT JOIN adw_prod.inc_pl.product_dim AS p
 	ON f.product_key = p.product_key
-left join adw_prod.inc_pl.date_dim AS d
+LEFT JOIN adw_prod.inc_pl.date_dim AS d
 on f.date_key = d.date_key
-where d.fin_period_no BETWEEN $F_START AND $F_END
+WHERE d.fin_period_no BETWEEN $F_START AND $F_END
 GROUP BY 1;
 
-
--- FINAL
---- In the future we might want to use a weighted sum instead and include argos customers
+--- Part 4 - In the future, we might want to include Argos customers and use a weighted sum
 CREATE
 	OR replace TEMP TABLE cvs_touchpoints AS
 SELECT c.inferred_customer_id
@@ -259,8 +312,7 @@ LEFT JOIN cvs_brand_touchpoints AS b
 LEFT JOIN cvs_gm AS g
 	ON c.inferred_customer_id = g.inferred_customer_id;
 
-
--- Combine all the main tables
+-- COMBINE ALL THE MAIN TABLES
 CREATE
 	OR replace TEMP TABLE cvs_all_features AS
 SELECT c.inferred_customer_id
@@ -290,21 +342,14 @@ LEFT JOIN cvs_sow AS sow
 LEFT JOIN cvs_touchpoints AS tp
 	ON c.inferred_customer_id = tp.inferred_customer_id;
 
--- Spend Scoring
+
+-- SPEND SCORING
 -- Any total spend that is negative should get the lowest score
 CREATE
 	OR replace TEMP TABLE cvs_log_spend AS
 SELECT inferred_customer_id
     , CASE WHEN spend >= 0 THEN LOG(10, spend + 1) ELSE LOG(10, 1) END AS log_spend
---  the below definitely needs to be replaced, but for now I had to put the below in, to mirror the old code
---     , LOG(10, CASE WHEN spend < spend_14_perc then spend_14_perc
---         WHEN spend > spend_99_99_perc then spend_99_99_perc
---         else spend end) AS log_spend
 from cvs_all_features
--- join (select PERCENTILE_DISC(0.9999) WITHIN GROUP (ORDER BY spend) AS spend_99_99_perc
---         , PERCENTILE_DISC(0.14) WITHIN GROUP (ORDER BY spend) AS spend_14_perc
---       from cvs_all_features
---       where active_customer = 1)
 where active_customer = 1;
 
 CREATE
@@ -325,7 +370,7 @@ JOIN (SELECT ABS(MIN(zscore_log_spend)) AS min_zscore_log_spend
         , MAX(zscore_log_spend) AS max_zscore_log_spend
       FROM cvs_zscore_log_spend);
 
--- Regularity Scoring
+-- REGULARITY SCORING
 -- Missing average days between purchases will be assigned the lowest score
 -- might bw better to set missing values to the MAX(log_regulrity)
 CREATE
@@ -336,7 +381,7 @@ FROM cvs_all_features
 JOIN (SELECT AVG(log_regularity) AS avg_log_regularity
         , STDDEV(log_regularity) AS std_log_regularity
       FROM cvs_all_features)
-where active_customer = 1;
+WHERE active_customer = 1;
 
 CREATE
 	OR replace TEMP TABLE cvs_regularity_score AS
@@ -347,14 +392,14 @@ JOIN (SELECT MAX(zscore_log_regularity) AS max_zscore_log_regularity
         , ABS(MIN(zscore_log_regularity)) + MAX(zscore_log_regularity) as comb_zscore_log_regularity
       FROM cvs_zscore_log_regularity);
 
--- Touchpoints Scoring
+-- TOUCHPOINTS SCORING
 -- decided not to add .00001 to the zscore
 CREATE
 	OR replace TEMP TABLE cvs_log_touchpoints AS
 SELECT inferred_customer_id
-    , LOG(10, touchpoints) as log_touchpoints
-from cvs_all_features
-where active_customer = 1;
+    , LOG(10, touchpoints) AS log_touchpoints
+FROM cvs_all_features
+WHERE active_customer = 1;
 
 CREATE
 	OR replace TEMP TABLE cvs_zscore_log_touchpoints AS
@@ -375,29 +420,34 @@ JOIN (SELECT ABS(MIN(zscore_log_touchpoints)) AS min_zscore_log_touchpoints
         , MAX(zscore_log_touchpoints) AS max_zscore_log_touchpoints
       FROM cvs_zscore_log_touchpoints);
 
+-- TENURE SCORING
 
--- Tenure Scoring
+CREATE
+	OR replace TEMP TABLE cvs_log_tenure AS
+SELECT inferred_customer_id
+    , CASE WHEN tenure >= 0 THEN LOG(10, tenure + 1) ELSE LOG(10, 1) END AS log_tenure
+from cvs_all_features
+where active_customer = 1;
+
+CREATE
+	OR replace TEMP TABLE cvs_zscore_log_tenure AS
+SELECT inferred_customer_id
+    , (log_tenure - avg_log_tenure)/std_log_tenure AS zscore_log_tenure
+FROM cvs_log_tenure
+JOIN (SELECT AVG(log_tenure) AS avg_log_tenure
+        , STDDEV(log_tenure) AS std_log_tenure
+      FROM cvs_log_tenure);
+
 CREATE
 	OR replace TEMP TABLE cvs_tenure_score AS
 SELECT inferred_customer_id
-//    , (CASE WHEN tenure > $nectar_years then $nectar_years else tenure end)/$nectar_years * 10 AS tenure_score
-// fix to be match old model more closely
-    , (CASE WHEN tenure > $nectar_years THEN 7 ELSE tenure end) /$nectar_years * 10 AS tenure_score
-FROM cvs_all_features
-WHERE active_customer = 1;
+    , (zscore_log_tenure + min_zscore_log_tenure) / (max_zscore_log_tenure + min_zscore_log_tenure) * 10 AS tenure_score
+FROM cvs_zscore_log_tenure
+JOIN (SELECT ABS(MIN(zscore_log_tenure)) AS min_zscore_log_tenure
+        , MAX(zscore_log_tenure) AS max_zscore_log_tenure
+      FROM cvs_zscore_log_tenure);
 
-CREATE
-	OR replace TEMP TABLE cvs_tenure_score_adj AS
-SELECT t.inferred_customer_id
-    , tenure_score
-    , CASE WHEN recency >= 85 or recency is null THEN 10
-        WHEN recency >= 29 THEN tenure_score - ((recency-28) / 56)
-        ELSE 0 end as tenure_score_adj
-from cvs_tenure_score as t
-left join cvs_all_features as r
-on t.inferred_customer_id = r.inferred_customer_id;
-
--- Share of Wallet Scoring
+-- SHARE OF WALLET SCORING
 CREATE
 	OR replace TEMP TABLE cvs_sow_score AS
 SELECT inferred_customer_id
@@ -405,7 +455,7 @@ SELECT inferred_customer_id
 FROM cvs_all_features
 where active_customer = 1;
 
--- Recency Scoring
+-- RECENCY SCORING
 CREATE
 	OR replace TEMP TABLE cvs_recency_cdf AS
 SELECT inferred_customer_id
@@ -423,24 +473,23 @@ JOIN (
   SELECT MAX(CASE WHEN recency = 1 THEN 1 - cdf_recency ELSE 0 END) AS max_cdf
   FROM cvs_recency_cdf);
 
--- Final Score
+-- FINAL SCORE
 CREATE
 	OR replace TABLE cvs_score_new AS
 SELECT a.inferred_customer_id
     , CASE WHEN active_customer = 1 THEN
-      (IFNULL(spend_score * $spend, 0)
+      (spend_score * $spend
       + regularity_score * $regularity
       + touchpoints_score * $touchpoints
-//      + IFNULL(CASE WHEN (tenure_score * $tenure - tenure_score_adj) < 0 THEN 0 ELSE (tenure_score * $tenure - tenure_score_adj) end, 0)
+      + tenure_score * $tenure
       + sow_score * $sow
       + recency_score * $recency) ELSE 0 END AS score
-   , IFNULL(spend_score * $spend, 0) AS spend
-   , regularity_score * $regularity AS regularity
-   , touchpoints_score * $touchpoints AS touchpoints
-//   , CASE WHEN (tenure_score * $tenure - tenure_score_adj) < 0 THEN 0 ELSE (tenure_score * $tenure - tenure_score_adj) end AS tenure
-   , 0 AS tenure
-   , sow_score * $sow AS sow
-   , recency_score * $recency AS recency
+   , spend
+   , regularity
+   , touchpoints
+   , tenure
+   , avg_sow
+   , recency
 FROM cvs_all_features AS a
 LEFT JOIN cvs_spend_score AS b
     ON a.inferred_customer_id = b.inferred_customer_id
@@ -448,39 +497,9 @@ LEFT JOIN cvs_regularity_score AS c
     ON a.inferred_customer_id = c.inferred_customer_id
 LEFT JOIN cvs_touchpoints_score AS d
     ON a.inferred_customer_id = d.inferred_customer_id
-LEFT JOIN cvs_tenure_score_adj AS e
+LEFT JOIN cvs_tenure_score AS e
     ON a.inferred_customer_id = e.inferred_customer_id
 LEFT JOIN cvs_sow_score AS f
     ON a.inferred_customer_id = f.inferred_customer_id
 LEFT JOIN cvs_recency_score AS g
     ON a.inferred_customer_id = g.inferred_customer_id;
-
-CREATE
-	OR replace TABLE cvs_score_comp AS
-SELECT new.inferred_customer_id
-    , old."Spend_Score" * $spend AS spend_old
-    , old."Regularity_score" * $regularity AS regularity_old
-    , old."Recency_score" * $recency AS recency_old
-    , IFNULL(CASE WHEN (old.tenure_score * $tenure - old.tenure_score_adj) < 0 THEN 0 ELSE (old.tenure_score * $tenure - old.tenure_score_adj) END, 0) AS tenure_old
-    , old."SOW_Score" * $sow AS sow_old
-    , old."TP_Score" * $touchpoints AS touchpoints_old
-    , old."Score_ver2_1_202002" AS score_old
-    , old.recency AS recency2_old
-    , old.regularity AS regularity2_old
-
-    , new.spend AS spend_new
-    , new.regularity AS regularity_new
-    , new.recency AS recency_new
-    , new.tenure AS tenure_new
-    , new.sow AS sow_new
-    , new.touchpoints AS touchpoints_new
-    , new.score AS score_new
-    , a.recency AS recency2_new
-    , b.regularity AS regularity2_new
-FROM cvs_score_old AS old
-INNER JOIN CVS_SCORE_NEW AS new
-ON old."Enterprise_Customer_ID" = new.inferred_customer_id
-LEFT JOIN cvs_recency AS a
-ON new.inferred_customer_id = a.inferred_customer_id
-INNER JOIN cvs_all_features AS b
-ON new.inferred_customer_id = b.inferred_customer_id;
