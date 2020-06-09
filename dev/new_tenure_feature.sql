@@ -83,7 +83,7 @@ select r.inferred_customer_id
     , ifnull(run_start_date, first_purchase_date) as run_start
     , case when days_between_purchases is null
         and ifnull(run_start_date, first_purchase_date) is not null
-        then iff(datediff(d, last_purchase_date, $end_date) > 84, last_purchase_date, $end_date)
+        then iff(datediff(d, last_purchase_date, $end_date) >= 84, last_purchase_date, $end_date)
         else run_end_date end as run_end
     , iff(datediff(d, last_purchase_date, $end_date) > 84, 1, 0) as lapsed
     , row_number() over (partition by r.inferred_customer_id order by ifnull(run_start_date, first_purchase_date)) as run_number
